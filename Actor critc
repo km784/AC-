@@ -1,0 +1,1740 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+from collections import defaultdict
+import pandas as pd
+
+class Microgrid:
+    def __init__(self, battery_capacity=5.22, max_discharge_rate=2.6, max_charge_rate=2.6, 
+                 load_profile=None, solar_profile=None):
+        """
+        Initialize the microgrid environment with a battery, load profile, and solar generation profile.
+        
+        Parameters:
+        -----------
+        battery_capacity: float
+            Maximum battery capacity in kWh
+        max_discharge_rate: float
+            Maximum discharge rate in kWh per hour
+        max_charge_rate: float
+            Maximum charge rate in kWh per hour
+        load_profile: list or numpy array
+            24-hour load profile (kWh per hour). If None, the profile from the image is used.
+        solar_profile: list or numpy array
+            24-hour solar generation profile (kWh per hour). If None, a default profile is created.
+        """
+        self.battery_capacity = battery_capacity
+        self.max_discharge_rate = max_discharge_rate
+        self.max_charge_rate = max_charge_rate
+        
+        # Set the load profile from the image if none is provided
+        if load_profile is None:
+            # These values are extracted from the image
+            # They represent the hourly total load (grid + solar + battery)
+            self.load_profile = self.create_load_profile_from_image()
+        else:
+            # Use the provided load profile
+            self.load_profile = np.array(load_profile)
+            
+            # Ensure the profile has 24 hours
+            if len(self.load_profile) != 24:
+                raise ValueError("Load profile must have 24 values (one for each hour)")
+        
+        # Set the solar generation profile
+        if solar_profile is None:
+            # Create a default solar generation profile
+            self.solar_profile = self.create_default_solar_profile()
+        else:
+            # Use the provided solar profile
+            self.solar_profile = np.array(solar_profile)
+            
+            # Ensure the profile has 24 hours
+            if len(self.solar_profile) != 24:
+                raise ValueError("Solar profile must have 24 values (one for each hour)")
+        
+        # Initialize state variables
+        self.battery_charge = 0.5 * battery_capacity  # Start half charged
+        self.time_step = 0  # Time step (hour of day)
+        self.total_cost = 0
+        self.min_soc = 15
+        self.max_soc = 80
+        self.battery_soc = 50
+        
+        self.first_episode = True
+        
+        # Define fixed tariff structure (pence per kWh)
+        self.fixed_consumption_tariff = 0.25
+        self.fixed_injection_tariff = 0.15  # Keeping the same injection tariff
+        
+        # Define actions
+        # 0: Do nothing (buy from grid)
+        # 2: Discharge battery to load
+        # 3: Charge battery from PV
+        # 4: Export excess PV to grid
+        self.actions = [0, 1, 2, 3,]
+        self.max_steps = 24
+    
+    def create_load_profile_from_image(self):
+        """
+        Create a load profile based on the values from the image.
+        Returns an array with 24 hourly values.
+        """
+        # The image shows values for March 10th at different times
+        # Let's extract the total energy consumption per hour (adding grid + solar + battery)
+        
+        # From the image, combining half-hourly values into hourly values:
+        # Hours are approximate based on x-axis labels in the image
+        hourly_load = [
+            0.37,   # 00:00 - 01:00 (0.2 + 0.2)
+            0.33,   # 01:00 - 02:00 (0.2 + 0.1)
+            0.56,   # 02:00 - 03:00 (0.1 + 0.1)
+            0.43,   # 03:00 - 04:00 (0.1 + 0.1)
+            0.31,   # 04:00 - 05:00 (0.2 + 0.4 from adjacent bars)
+            0.34,   # 05:00 - 06:00 (0.6 + 1.1)
+            0.41,   # 06:00 - 07:00 (1.1 + 1.1)
+            0.47,   # 07:00 - 08:00 (0.5 + 0.2)
+            0.33,   # 08:00 - 09:00 (0.2 + 0.1)
+            0.31,   # 09:00 - 10:00 (0.2 + 0.1)
+            0.31,   # 10:00 - 11:00 (0.2 + 0.2)
+            0.3,   # 11:00 - 12:00 (0.5 + 0.5)
+            0.27,   # 12:00 - 13:00 (0.6 + 0.8)
+            0.11,   # 13:00 - 14:00 (0.7 + 0.6)
+            0.25,   # 14:00 - 15:00 (0.4 + 0.7 including small blue component)
+            0.38,   # 15:00 - 16:00 (0.6 + 0.6 including blue component)
+            0.27,   # 16:00 - 17:00 (1.1 + 0.5)
+            0.32,   # 17:00 - 18:00 (0.4 + 0.4)
+            0.33,   # 18:00 - 19:00 (0.1 + 0.2)
+            0.56,   # 19:00 - 20:00 (0.2 + 0.3 including blue component)
+            0.43,   # 20:00 - 21:00 (0.2 + 0.3 including blue component)
+            0.31,   # 21:00 - 22:00 (0.29 + 0.39)
+            0.34,   # 22:00 - 23:00 (0.1 + 0.2)
+            0.41,   
+        ]
+        
+        return np.array(hourly_load)
+    
+    def create_default_solar_profile(self):
+        """
+        Create a default solar generation profile.
+        Returns an array with 24 hourly values representing a typical bell-shaped solar generation curve.
+        """
+        # Create a bell-shaped curve for solar generation (peak around noon)
+        # No generation at night (hours 0-5 and 19-23)
+        solar_profile = np.zeros(24)
+        
+        # Morning ramp-up
+        solar_profile[6] = 0.2    # 06:00
+        solar_profile[7] = 0.6    # 07:00
+        solar_profile[8] = 1.08    # 08:00
+        solar_profile[9] = 1.70   # 09:00
+        
+        # Midday peak
+        solar_profile[10] = 2.31   # 10:00
+        solar_profile[11] = 3.15   # 11:00
+        solar_profile[12] = 3.04   # 12:00
+        solar_profile[13] = 2.75   # 13:00
+        
+        # Afternoon decline
+        solar_profile[14] = 1.64   # 14:00
+        solar_profile[15] = 0.80   # 15:00
+        solar_profile[16] = 0.37   # 16:00
+        solar_profile[17] = 0.08   # 17:00
+        solar_profile[18] = 0.1   # 18:00
+        
+        return solar_profile
+    
+    def get_current_load(self):
+        """Get the load demand for the current time step."""
+        return self.load_profile[self.time_step]
+    
+    def get_current_solar(self):
+        """Get the solar generation for the current time step."""
+        return self.solar_profile[self.time_step]
+        
+    def reset(self):
+        """Reset the environment to start a new day but maintain battery charge from previous day."""
+        if self.first_episode:
+            # Only on the first episode, set battery to initial value
+            self.battery_charge = 0.5 * self.battery_capacity
+            self.battery_soc = 50  
+            self.first_episode = False
+        # For subsequent episodes, keep the battery_charge from the end of previous episode
+        
+        # Reset time step and cost for the new day
+        self.time_step = 0
+        self.total_cost = 0
+        
+        return self._get_state()
+     
+    def _get_state(self):
+        """
+        Convert continuous state space to discrete state for Q-learning.
+        Now includes the current load level, solar level, and time of day in the state.
+        """
+        # Discretize battery charge into 50 levels for more granularity
+        battery_level = int(50 * self.battery_charge / self.battery_capacity)
+        
+        # Ensure the battery level is between 0 and 49
+        battery_level = max(0, min(49, battery_level))
+        
+        # Discretize load into 5 levels based on the range of the load profile
+        current_load = self.get_current_load()
+        max_load = max(self.load_profile)
+        min_load = min(self.load_profile)
+        load_range = max_load - min_load
+        
+        if load_range == 0:  # Constant load
+            load_level = 2  # Medium
+        else:
+            # Calculate normalized load level (0-4)
+            load_level = int((current_load - min_load) / load_range * 4)
+            load_level = max(0, min(4, load_level))
+        
+        # Discretize solar generation into 5 levels based on the range of the solar profile
+        current_solar = self.get_current_solar()
+        max_solar = max(self.solar_profile)
+        
+        if max_solar == 0:  # No solar generation
+            solar_level = 0
+        else:
+            # Calculate normalized solar level (0-4)
+            solar_level = int((current_solar / max_solar) * 4)
+            solar_level = max(0, min(4, solar_level))
+        
+        # Return as a tuple (battery_level, time_step, load_level, solar_level)
+        return (battery_level, self.time_step, load_level, solar_level)
+    
+    def _get_tariffs(self):
+        """Return the current tariffs (now always fixed)."""
+        return self.fixed_consumption_tariff, self.fixed_injection_tariff
+        
+    def _charge_to_soc(self, charge):
+        """Convert battery charge (kWh) to state of charge (%)."""
+        return (charge / self.battery_capacity) * 100
+    
+    def _soc_to_charge(self, soc):
+        """Convert state of charge (%) to battery charge (kWh)."""
+        return (soc / 100) * self.battery_capacity
+    
+    def step(self, action):
+        """
+        Take an action in the environment and return the next state, reward, and done flag.
+        
+        Parameters:
+        -----------
+        action: int
+            4 actions with simplified action space: 
+            0: Do nothing (use solar for load, buy remaining from grid)
+            1: Discharge battery to load (after using available solar)
+            2: Charge battery from excess PV
+            3: Export excess PV to grid
+            
+        Returns:
+        --------
+        next_state: tuple
+            The next state after taking the action
+        reward: float
+            The reward for taking the action
+        done: bool
+            Whether the episode is done
+        info: dict
+            Additional information
+        """
+        # Get current tariffs, load, and solar generation
+        consumption_tariff, injection_tariff = self._get_tariffs()
+        current_load = self.get_current_load()
+        current_solar = self.get_current_solar()
+        
+        # Initialize variables
+        grid_import = 0
+        grid_export = 0
+        battery_charge_change = 0
+        solar_used = 0
+        solar_wasted = 0
+        
+        # Process the action based on the SIMPLIFIED action space
+        if action == 0:  # Do nothing (use solar for load, buy remaining from grid)
+            # Use available solar generation first
+            solar_used = min(current_solar, current_load)
+            grid_import = current_load - solar_used
+            
+            # Export any excess solar to the grid
+            if current_solar > current_load:
+                grid_export = current_solar - current_load
+        
+        elif action == 1:  # Discharge battery to load (after using available solar)
+            # Use available solar generation first
+            solar_used = min(current_solar, current_load)
+            remaining_load = current_load - solar_used
+            
+            # Calculate maximum possible discharge considering SOC constraints
+            available_discharge = self.battery_charge - self._soc_to_charge(self.min_soc)
+            max_discharge = min(self.max_discharge_rate, available_discharge, remaining_load)
+            
+            if max_discharge > 0:
+                battery_charge_change = -max_discharge
+                grid_import = max(0, remaining_load - max_discharge)
+                
+                # Export any excess solar to the grid
+                if current_solar > current_load:
+                    grid_export = current_solar - current_load
+            else:
+                # If we can't discharge, fall back to buying from grid
+                grid_import = remaining_load
+                
+                # Export any excess solar to the grid
+                if current_solar > current_load:
+                    grid_export = current_solar - current_load
+        
+        elif action == 2:  # Charge battery from excess PV
+            # Calculate how much solar power is available after meeting load
+            excess_solar = max(0, current_solar - current_load)
+            
+            # Use solar for load first
+            solar_used = min(current_solar, current_load)
+            
+            # Buy from grid if solar is not enough for load
+            if current_solar < current_load:
+                grid_import = current_load - current_solar
+            
+            # If we have excess solar, use it to charge the battery
+            if excess_solar > 0:
+                # Calculate maximum possible charge considering SOC constraints
+                max_charge = min(
+                    self.max_charge_rate,
+                    self._soc_to_charge(self.max_soc) - self.battery_charge,
+                    excess_solar
+                )
+                
+                if max_charge > 0:
+                    battery_charge_change = max_charge
+                    solar_used += max_charge
+                    
+                    # Export any remaining excess solar to the grid
+                    remaining_excess = excess_solar - max_charge
+                    if remaining_excess > 0:
+                        grid_export = remaining_excess
+            
+        elif action == 3:  # Export excess PV to grid
+            # Use solar for load first
+            solar_used = min(current_solar, current_load)
+            
+            # Buy from grid if solar is not enough for load
+            if current_solar < current_load:
+                grid_import = current_load - current_solar
+            
+            # Export excess solar to the grid
+            if current_solar > current_load:
+                grid_export = current_solar - current_load
+        
+        # Update battery charge
+        self.battery_charge += battery_charge_change
+        
+        # Ensure battery stays within physical constraints
+        self.battery_charge = max(0, min(self.battery_capacity, self.battery_charge))
+        
+        # Calculate current SOC
+        current_soc = self._charge_to_soc(self.battery_charge)
+        self.battery_soc = current_soc
+        
+        # Calculate cost: grid import cost - grid export revenue
+        cost = grid_import * consumption_tariff - grid_export * injection_tariff
+        
+        # Update total cost
+        self.total_cost += cost
+        
+        # Apply SOC penalty if constraints violated
+        soc_penalty = 0
+        if current_soc < self.min_soc:
+            soc_penalty = -100 * (self.min_soc - current_soc)  # Larger penalty for lower SOC
+        elif current_soc > self.max_soc:
+            soc_penalty = -100 * (current_soc - self.max_soc)  # Larger penalty for higher SOC
+        
+        # Calculate reward (negative cost plus any penalties)
+        reward = -cost + soc_penalty
+        
+        # Update time step
+        self.time_step = (self.time_step + 1) % 24
+        
+        # Check if episode is done (after 24 hours)
+        done = self.time_step == 0
+        
+        # Return the next state, reward, done flag, and info
+        info = {
+            'cost': cost,
+            'grid_import': grid_import,
+            'grid_export': grid_export,
+            'battery_charge': self.battery_charge,
+            'battery_soc': current_soc,
+            'battery_change': battery_charge_change,
+            'solar_generation': current_solar,
+            'solar_used': solar_used,
+            'solar_wasted': solar_wasted,
+            'soc_penalty': soc_penalty,
+            'action_type': ['no_action', 'discharge', 'charge_pv', 'export_pv'][action],
+            'action_percentage': 100 if action > 0 else 0,
+            'is_peak': False,  # No concept of peak hours with fixed tariff
+        }
+        
+        return self._get_state(), reward, done, info
+    
+    
+    def calculate_theoretical_min_cost(self, days=3):
+        """
+        Calculate the theoretical minimum cost for a microgrid with solar PV over multiple days
+        with persistent battery state of charge between days and SOC constraints.
+        """
+        # Create a deep copy of the environment to avoid modifying the original
+        from copy import deepcopy
+        test_env = deepcopy(self)
+        
+        # Define SOC constraints - using the class's min_soc and max_soc values
+        min_soc = test_env.min_soc  # 15%
+        max_soc = test_env.max_soc  # 80%
+        
+        # Convert SOC percentages to absolute battery charge values
+        min_charge = (min_soc / 100) * test_env.battery_capacity
+        max_charge = (max_soc / 100) * test_env.battery_capacity
+        
+        # Initialize battery charge at minimum SOC
+        battery_charge = min_charge
+        
+        # Log of actions and costs for all days
+        all_days_log = []
+        
+        # Simulate multiple days to reach steady state
+        for day in range(days):
+            day_actions_log = []
+            day_total_cost = 0
+            
+            # Run for 24 hours
+            for hour in range(24):
+                test_env.time_step = hour
+                
+                # Get current tariffs, load, and solar generation
+                consumption_tariff, injection_tariff = test_env._get_tariffs()
+                current_load = test_env.load_profile[hour]
+                current_solar = test_env.solar_profile[hour]
+                
+                # Initialize variables
+                grid_import = 0
+                grid_export = 0
+                battery_charge_change = 0
+                solar_used = 0
+                action = 0
+                
+                # Determine the optimal action based on the current state
+                # 1. Use solar to meet load directly
+                solar_to_load = min(current_solar, current_load)
+                solar_used = solar_to_load
+                remaining_load = current_load - solar_to_load
+                excess_solar = max(0, current_solar - current_load)
+                
+                # 2. If there's excess solar, use it to charge the battery
+                if excess_solar > 0:
+                    battery_space = max_charge - battery_charge
+                    solar_to_battery = min(test_env.max_charge_rate, battery_space, excess_solar)
+                    
+                    if solar_to_battery > 0:
+                        battery_charge_change += solar_to_battery
+                        solar_used += solar_to_battery
+                        action = 3  # Charge from PV
+                    
+                    # If there's still excess solar after charging battery, export to grid
+                    remaining_excess = excess_solar - solar_to_battery
+                    if remaining_excess > 0:
+                        grid_export = remaining_excess
+                        # If we're primarily exporting, change action to export PV
+                        if battery_charge_change == 0:
+                            action = 4  # Export PV
+                
+                # 3. If there's remaining load, use battery to meet it if cost-effective
+                if remaining_load > 0:
+                    available_discharge = battery_charge - min_charge
+                    potential_discharge = min(test_env.max_discharge_rate, available_discharge, remaining_load)
+                    
+                    if potential_discharge > 0:
+                        battery_charge_change -= potential_discharge
+                        remaining_load -= potential_discharge
+                        action = 2  # Discharge battery
+                
+                # 4. Any remaining load must be met by grid import
+                if remaining_load > 0:
+                    grid_import = remaining_load
+                    if battery_charge_change == 0 and grid_export == 0:
+                        action = 0  # Do nothing (buy from grid)
+                
+                # Update battery charge
+                battery_charge += battery_charge_change
+                battery_charge = max(min_charge, min(max_charge, battery_charge))
+                
+                # Calculate cost
+                cost = grid_import * consumption_tariff - grid_export * injection_tariff
+                
+                # Update total cost
+                day_total_cost += cost
+                
+                # Log the action and resulting state
+                step_log = {
+                    'day': day,
+                    'hour': hour,
+                    'is_peak': False,  # No concept of peak hours with fixed tariff
+                    'action': action,
+                    'action_name': {0: 'Do Nothing', 1: 'Charge Grid', 2: 'Discharge', 
+                                    3: 'Charge PV', 4: 'Export PV'}[action],
+                    'battery_charge': battery_charge,
+                    'battery_soc': (battery_charge / test_env.battery_capacity) * 100,
+                    'grid_import': grid_import,
+                    'grid_export': grid_export,
+                    'solar_generation': current_solar,
+                    'solar_used': solar_used,
+                    'battery_change': battery_charge_change,
+                    'tariff': consumption_tariff,
+                    'cost': cost
+                }
+                day_actions_log.append(step_log)
+            
+            # Save this day's log
+            all_days_log.append({'day': day, 'total_cost': day_total_cost, 'actions': day_actions_log})
+            
+            # Print day summary
+            print(f"Day {day+1}: Total Cost = {day_total_cost:.2f} pence, Ending SOC = {(battery_charge / test_env.battery_capacity) * 100:.1f}%")
+        
+        # Return the steady state (final day) cost and actions
+        steady_state_daily_cost = all_days_log[-1]['total_cost']
+        steady_state_actions_log = all_days_log[-1]['actions']
+        
+        # Calculate statistics for the steady state day
+        action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+        solar_utilization = 0
+        total_solar = 0
+        
+        for log in steady_state_actions_log:
+            action_counts[log['action']] += 1
+            solar_utilization += log['solar_used']
+            total_solar += log['solar_generation']
+        
+        solar_utilization_percentage = (solar_utilization / total_solar * 100) if total_solar > 0 else 0
+        
+        print("\nSteady State Summary (Final Day):")
+        print(f"Theoretical Minimum Cost: {steady_state_daily_cost:.2f} pence for 24 hours")
+        print(f"Final Battery SOC: {(battery_charge / test_env.battery_capacity) * 100:.1f}%")
+        print(f"Solar Utilization: {solar_utilization:.2f} kWh / {total_solar:.2f} kWh ({solar_utilization_percentage:.1f}%)")
+        
+        print("\nAction Distribution:")
+        for action, count in action_counts.items():
+            action_name = {0: "Do Nothing", 1: "Charge Grid", 2: "Discharge", 
+                           3: "Charge PV", 4: "Export PV"}[action]
+            print(f"  {action_name}: {count} times ({count/24*100:.1f}%)")
+        
+        return steady_state_daily_cost, steady_state_actions_log, battery_charge
+
+class QLearning:
+    def __init__(self, env, learning_rate=0.5, discount_factor=0.99, exploration_rate=1.0, 
+                 exploration_decay=0.9995, min_exploration_rate=0.01):
+        """
+        Initialize the Q-learning agent.
+        
+        Parameters:
+        -----------
+        env: Microgrid
+            The environment to learn from
+        learning_rate: float
+            The learning rate (alpha)
+        discount_factor: float
+            The discount factor (gamma)
+        exploration_rate: float
+            Initial exploration rate (epsilon)
+        exploration_decay: float
+            Rate at which exploration rate decays
+        min_exploration_rate: float
+            Minimum exploration rate
+        """
+        self.env = env
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.exploration_rate = exploration_rate
+        self.exploration_decay = exploration_decay
+        self.min_exploration_rate = min_exploration_rate
+        
+        # Initialize Q-table as a defaultdict of defaultdicts
+        # Q[(battery_level, time_step, load_level, solar_level)][action] = Q-value
+        self.q_table = defaultdict(lambda: defaultdict(float))
+        
+        # Store metrics
+        self.episode_rewards = []
+        self.episode_costs = []
+        self.episode_battery_usage = []
+        self.episode_solar_utilization = []
+    
+    def choose_action(self, state):
+        """
+        Choose an action using epsilon-greedy policy.
+        
+        Parameters:
+        -----------
+        state: tuple
+            The current state
+            
+        Returns:
+        --------
+        action: int
+            The chosen action
+        """
+        # Explore: choose a random action
+        if np.random.random() < self.exploration_rate:
+            return np.random.choice(self.env.actions)
+        
+        # Exploit: choose the best action based on Q-values
+        # If multiple actions have the same Q-value, choose randomly among them
+        q_values = [self.q_table[state][a] for a in self.env.actions]
+        max_q = max(q_values)
+        best_actions = [a for a, q in zip(self.env.actions, q_values) if q == max_q]
+        return np.random.choice(best_actions)
+    
+    def update_q_value(self, state, action, reward, next_state):
+        """
+        Update Q-value using the Q-learning update rule.
+        
+        Parameters:
+        -----------
+        state: tuple
+            The current state
+        action: int
+            The action taken
+        reward: float
+            The reward received
+        next_state: tuple
+            The next state
+        """
+        # Get the best Q-value for the next state
+        best_next_q = max([self.q_table[next_state][a] for a in self.env.actions], default=0)
+        
+        # Update Q-value using Q-learning update rule
+        current_q = self.q_table[state][action]
+        self.q_table[state][action] = current_q + self.learning_rate * (
+            reward + self.discount_factor * best_next_q - current_q
+        )
+    
+    def decay_exploration_rate(self):
+        """Decay the exploration rate."""
+        self.exploration_rate = max(
+            self.min_exploration_rate, 
+            self.exploration_rate * self.exploration_decay
+        )
+    
+    def train(self, num_episodes=1000, evaluate_interval=100):
+        """
+        Train the agent for a specified number of episodes.
+        Updated to handle the new action space with PV generation.
+        
+        Parameters:
+        -----------
+        num_episodes: int
+            Number of episodes to train
+        evaluate_interval: int
+            Interval to display progress and evaluate the agent
+            
+        Returns:
+        --------
+        metrics: dict
+            Dictionary containing training metrics
+        """
+        
+        evaluation_results = []
+        solar_utilization_rates = []  # Track solar utilization during training
+
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            battery_usage = 0
+            solar_generation = 0
+            solar_used = 0
+            
+            done = False
+            while not done:
+                # Choose action
+                action = self.choose_action(state)
+                
+                # Take action
+                next_state, reward, done, info = self.env.step(action)
+                
+                # Update Q-value
+                self.update_q_value(state, action, reward, next_state)
+                
+                # Update state
+                state = next_state
+                
+                # Update metrics
+                episode_reward += reward
+                battery_usage += abs(info['battery_change'])
+                solar_generation += info['solar_generation']
+                solar_used += info['solar_used']
+            
+            # Decay exploration rate
+            self.decay_exploration_rate()
+            
+            # Calculate solar utilization rate
+            solar_utilization_rate = (solar_used / solar_generation * 100) if solar_generation > 0 else 0
+            solar_utilization_rates.append(solar_utilization_rate)
+            
+            # Store metrics
+            self.episode_rewards.append(episode_reward)
+            self.episode_costs.append(self.env.total_cost)
+            self.episode_battery_usage.append(battery_usage)
+            self.episode_solar_utilization.append(solar_utilization_rate)
+            
+            # Print progress at regular intervals
+            if (episode + 1) % 100 == 0:
+                print(f"Episode: {episode + 1}/{num_episodes}, Reward: {episode_reward:.2f}, " +
+                      f"Cost: {self.env.total_cost:.2f}, Solar Utilization: {solar_utilization_rate:.1f}%")
+            
+            # Evaluate at specified intervals
+            if (episode + 1) % evaluate_interval == 0 or episode == num_episodes - 1:
+                print(f"\nEvaluating at episode {episode + 1}...")
+                results = self.evaluate(num_episodes=1)
+                evaluation_results.append({
+                    'training_episode': episode + 1,
+                    'evaluation_data': results[0]
+                })
+        
+        return {
+            'rewards': self.episode_rewards,
+            'costs': self.episode_costs,
+            'battery_usage': self.episode_battery_usage,
+            'solar_utilization': solar_utilization_rates,
+            'evaluations': evaluation_results
+        }
+        
+    def evaluate(self, num_episodes=1):
+        """
+        Evaluate the trained agent without exploration.
+        Updated to include solar PV generation metrics.
+        
+        Parameters:
+        -----------
+        num_episodes: int
+            Number of episodes to evaluate
+            
+        Returns:
+        --------
+        results: list
+            List of dictionaries containing evaluation results for each episode
+        """
+        results = []
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            episode_info = []
+            
+            total_solar_generation = 0
+            total_solar_used = 0
+            
+            done = False
+            while not done:
+                # Choose the best action (no exploration)
+                q_values = [self.q_table[state][a] for a in self.env.actions]
+                max_q = max(q_values)
+                best_actions = [a for a, q in zip(self.env.actions, q_values) if q == max_q]
+                action = np.random.choice(best_actions)
+                
+                # Take action
+                next_state, reward, done, info = self.env.step(action)
+                
+                # Update state
+                state = next_state
+                
+                # Update metrics
+                episode_reward += reward
+                total_solar_generation += info['solar_generation']
+                total_solar_used += info['solar_used']
+                
+                # Store step info with additional PV generation metrics
+                step_info = {
+                    'time_step': self.env.time_step,
+                    'battery_charge': self.env.battery_charge,
+                    'battery_soc': self.env._charge_to_soc(self.env.battery_charge),
+                    'action': action,
+                    'action_type': ['no_action', 'discharge', 'charge_pv', 'export_pv'][action],
+                    'cost': info['cost'],
+                    'grid_import': info['grid_import'],
+                    'grid_export': info['grid_export'],
+                    'battery_change': info['battery_change'],
+                    'solar_generation': info['solar_generation'],
+                    'solar_used': info['solar_used'],
+                    'solar_wasted': info['solar_wasted'] if 'solar_wasted' in info else 0,
+                    'is_peak': info['is_peak'] if 'is_peak' in info else False
+                }
+                episode_info.append(step_info)
+            
+            # Calculate solar utilization rate
+            solar_utilization_rate = (total_solar_used / total_solar_generation * 100) if total_solar_generation > 0 else 0
+            
+            results.append({
+                'episode': episode,
+                'total_reward': episode_reward,
+                'total_cost': self.env.total_cost,
+                'total_solar_generation': total_solar_generation,
+                'total_solar_used': total_solar_used,
+                'solar_utilization_rate': solar_utilization_rate,
+                'steps': episode_info
+            })
+            
+            print(f"Evaluation Episode: {episode + 1}, Total Reward: {episode_reward:.2f}, " +
+                  f"Total Cost: {self.env.total_cost:.2f}, Solar Utilization: {solar_utilization_rate:.1f}%")
+        
+        return results
+    
+    def plot_load_profile(self):
+        """Plot the load profile for visualization."""
+        plt.figure(figsize=(12, 6))
+        # Change self.load_profile to self.env.load_profile
+        plt.bar(range(24), self.env.load_profile, color='blue', alpha=0.7)
+        plt.title('Daily Load Profile from Image Data', fontsize=14)
+        plt.xlabel('Hour of Day')
+        plt.ylabel('Load Demand (kWh)')
+        plt.grid(True, alpha=0.3)
+        plt.xticks(range(0, 24, 2))
+        
+        # Highlight peak hours
+        peak_hours_morning = range(7, 11)
+        peak_hours_evening = range(17, 21)
+        for hour in list(peak_hours_morning) + list(peak_hours_evening):
+            plt.axvspan(hour-0.5, hour+0.5, alpha=0.2, color='yellow')
+        
+        # Add average line
+        # Change self.load_profile to self.env.load_profile
+        avg_load = np.mean(self.env.load_profile)
+        plt.axhline(y=avg_load, color='r', linestyle='--', alpha=0.7, 
+                    label=f'Average: {avg_load:.2f} kWh')
+        
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('image_load_profile.png')
+        plt.show()
+    
+    def plot_training_metrics(self):
+        """Plot training metrics, updated to include solar generation metrics."""
+        fig, axs = plt.subplots(4, 1, figsize=(10, 18))
+        
+        # Plot rewards
+        axs[0].plot(self.episode_rewards)
+        axs[0].set_title('Episode Rewards')
+        axs[0].set_xlabel('Episode')
+        axs[0].set_ylabel('Reward')
+        axs[0].grid(True)
+        
+        # Plot costs
+        axs[1].plot(self.episode_costs)
+        axs[1].set_title('Episode Costs')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Cost (pence)')
+        axs[1].grid(True)
+        
+        # Plot battery usage
+        axs[2].plot(self.episode_battery_usage)
+        axs[2].set_title('Episode Battery Usage')
+        axs[2].set_xlabel('Episode')
+        axs[2].set_ylabel('Battery Usage (kWh)')
+        axs[2].grid(True)
+        
+        # Plot solar utilization rate
+        axs[3].plot(self.episode_solar_utilization)
+        axs[3].set_title('Episode Solar Utilization Rate')
+        axs[3].set_xlabel('Episode')
+        axs[3].set_ylabel('Solar Utilization (%)')
+        axs[3].set_ylim(0, 100)
+        axs[3].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('training_metrics.png')
+        plt.show()
+    
+    def plot_evaluation_results(self, results):
+        """
+        Plot evaluation results with updated metrics for PV generation.
+        
+        Parameters:
+        -----------
+        results: list
+            Evaluation results from the evaluate method
+        """
+        if not results:
+            print("No evaluation results to plot.")
+            return
+        
+        # Convert steps to DataFrame for easier analysis
+        steps_df = pd.DataFrame([step for result in results for step in result['steps']])
+        
+        fig, axs = plt.subplots(4, 1, figsize=(12, 20))
+        
+        # Plot battery charge over time
+        axs[0].plot(steps_df['time_step'], steps_df['battery_charge'])
+        axs[0].set_title('Battery Charge Over Time')
+        axs[0].set_xlabel('Hour of Day')
+        axs[0].set_ylabel('Battery Charge (kWh)')
+        axs[0].set_xticks(range(0, 24))
+        axs[0].grid(True)
+        
+        # Plot grid import/export over time
+        axs[1].plot(steps_df['time_step'], steps_df['grid_import'], 'b-', label='Import')
+        axs[1].plot(steps_df['time_step'], steps_df['grid_export'], 'g-', label='Export')
+        axs[1].set_title('Grid Interaction Over Time')
+        axs[1].set_xlabel('Hour of Day')
+        axs[1].set_ylabel('Energy (kWh)')
+        axs[1].set_xticks(range(0, 24))
+        axs[1].legend()
+        axs[1].grid(True)
+        
+        # Plot solar generation and usage
+        axs[2].plot(steps_df['time_step'], steps_df['solar_generation'], 'orange', label='Generation')
+        axs[2].plot(steps_df['time_step'], steps_df['solar_used'], 'r', label='Used')
+        axs[2].fill_between(steps_df['time_step'], steps_df['solar_generation'], steps_df['solar_used'], 
+                             color='yellow', alpha=0.3, label='Unused/Exported')
+        axs[2].set_title('Solar Generation and Usage')
+        axs[2].set_xlabel('Hour of Day')
+        axs[2].set_ylabel('Energy (kWh)')
+        axs[2].set_xticks(range(0, 24))
+        axs[2].legend()
+        axs[2].grid(True)
+        
+        # Plot action distribution
+        action_counts = steps_df['action'].value_counts().sort_index()
+        action_labels = {0: 'Do Nothing', 1: 'Discharge', 2: 'Charge PV', 3: 'Export PV'}
+        axs[3].bar(action_counts.index, action_counts.values)
+        axs[3].set_title('Action Distribution')
+        axs[3].set_xlabel('Action')
+        axs[3].set_ylabel('Count')
+        axs[3].set_xticks(list(action_labels.keys()))
+        axs[3].set_xticklabels([action_labels[a] for a in action_labels.keys()])
+        axs[3].grid(True)
+        
+        plt.tight_layout()
+        plt.savefig('evaluation_results.png')
+        plt.show()
+        
+        # Print summary statistics
+        print("\nSummary Statistics:")
+        print(f"Average Cost: {steps_df['cost'].mean():.2f} pence per hour")
+        print(f"Total Cost: {steps_df['cost'].sum():.2f} pence for {len(steps_df)} hours")
+        print(f"Average Grid Import: {steps_df['grid_import'].mean():.2f} kWh per hour")
+        print(f"Total Grid Import: {steps_df['grid_import'].sum():.2f} kWh")
+        print(f"Total Grid Export: {steps_df['grid_export'].sum():.2f} kWh")
+        print(f"Total Solar Generation: {steps_df['solar_generation'].sum():.2f} kWh")
+        print(f"Total Solar Used: {steps_df['solar_used'].sum():.2f} kWh")
+        
+        # Solar utilization rate
+        solar_utilization = (steps_df['solar_used'].sum() / steps_df['solar_generation'].sum() * 100) \
+                            if steps_df['solar_generation'].sum() > 0 else 0
+        print(f"Solar Utilization Rate: {solar_utilization:.1f}%")
+        
+        # Analyze actions by peak/off-peak if peak data is available
+        if 'is_peak' in steps_df.columns and steps_df['is_peak'].any():
+            peak_actions = steps_df[steps_df['is_peak']]['action'].value_counts().sort_index()
+            off_peak_actions = steps_df[~steps_df['is_peak']]['action'].value_counts().sort_index()
+            
+            print("\nAction Distribution by Time:")
+            print("Peak Hours:")
+            for action, count in peak_actions.items():
+                print(f"  {action_labels[action]}: {count} times " +
+                      f"({count/len(steps_df[steps_df['is_peak']])*100:.1f}%)")
+            
+            print("Off-Peak Hours:")
+            for action, count in off_peak_actions.items():
+                print(f"  {action_labels[action]}: {count} times " +
+                      f"({count/len(steps_df[~steps_df['is_peak']])*100:.1f}%)")
+            
+    def plot_battery_actions_vs_soc(self, results, episode_num=0):
+        """
+        Plot battery state of charge and actions over time for a specific episode.
+        
+        Parameters:
+        -----------
+        results: list
+            Evaluation results from the evaluate method
+        episode_num: int
+            Index of the episode to plot (default: 0)
+        """
+        if not results or episode_num >= len(results):
+            print(f"No evaluation results for episode {episode_num}.")
+            return
+        
+        # Get data for the specified episode
+        episode_data = results[episode_num]['steps']
+        
+        # Convert to DataFrame for easier plotting
+        df = pd.DataFrame(episode_data)
+        
+        # Calculate SOC percentage
+        df['soc_percentage'] = (df['battery_charge'] / self.env.battery_capacity) * 100
+        
+        # Create figure with two subplots sharing x-axis
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Plot battery SOC percentage over time
+        ax1.plot(df['time_step'], df['soc_percentage'], 'b-', linewidth=2.5)
+        ax1.set_ylabel('Battery State of Charge (%)')
+        ax1.set_ylim(0, 100)
+        ax1.grid(True, alpha=0.3)
+        
+        
+        # Add horizontal dotted lines for optimal SOC range (adjust these values as needed)
+        optimal_min = 10  # example optimal minimum SOC
+        optimal_max = 90  # example optimal maximum SOC
+        ax1.axhline(y=optimal_min, color='gray', linestyle=':', alpha=0.7)
+        ax1.axhline(y=optimal_max, color='gray', linestyle=':', alpha=0.7)
+        
+        # Add SOC statistics
+        average_soc = df['soc_percentage'].mean()
+        time_in_optimal_range = len(df[(df['soc_percentage'] >= optimal_min) & 
+                                       (df['soc_percentage'] <= optimal_max)]) / len(df) * 100
+        
+        # Count charge and discharge actions
+        charge_count = len(df[df['action'] == 1])
+        discharge_count = len(df[df['action'] == 2])
+        
+        # Count peak and off-peak discharges
+        peak_discharges = len(df[(df['action'] == 2) & df['is_peak']])
+        off_peak_discharges = discharge_count - peak_discharges
+        
+        # Add statistics to plot
+        stats_text = f"Episode {episode_num} Statistics:\n"
+        stats_text += f"Charges: {charge_count}\n"
+        stats_text += f"Discharges: {discharge_count}\n"
+        stats_text += f"Peak Hour Discharges: {peak_discharges}\n"
+        stats_text += f"Off-Peak Discharges: {off_peak_discharges}\n"
+        stats_text += f"Average SOC: {average_soc:.1f}%\n"
+        stats_text += f"Time in Optimal Range: {time_in_optimal_range:.1f}%"
+        
+        ax1.text(0.02, 0.97, stats_text, transform=ax1.transAxes, 
+                 verticalalignment='top', bbox=dict(boxstyle='round', 
+                 facecolor='white', alpha=0.8))
+        
+        # Set title for the top plot
+        ax1.set_title(f'Episode {episode_num}', fontsize=14)
+        
+        # Plot actions in the bottom subplot
+        # Create custom y-positions for the actions
+        action_positions = {0: 1, 1: 2, 2: 0}  # No Action, Charge, Discharge
+        action_colors = {0: 'blue', 1: 'green', 2: 'red'}
+        action_labels = {0: 'No Action', 1: 'Charge', 2: 'Discharge'}
+        
+        # Plot each action as a colored bar
+        for action in [0, 1, 2]:
+            action_times = df[df['action'] == action]['time_step']
+            if len(action_times) > 0:
+                ax2.barh(y=[action_positions[action]] * len(action_times), 
+                        width=[1] * len(action_times),
+                        left=action_times,
+                        color=action_colors[action],
+                        alpha=0.7,
+                        label=action_labels[action])
+        
+        # Set y-ticks and labels for the action plot
+        ax2.set_yticks([0, 1, 2])
+        ax2.set_yticklabels(['Discharge', 'No Action', 'Charge'])
+        
+        # Set x-axis properties
+        ax2.set_xlabel('Time of Day (Hour)')
+        ax2.set_xlim(0, 23)
+        ax2.set_xticks(range(0, 24, 4))
+        
+        # Add peak hour highlighting to action plot as well
+        for start, end in peak_hours_morning + peak_hours_evening:
+            ax2.axvspan(start, end, alpha=0.2, color='yellow')
+        
+        # Add legend to action plot
+        handles, labels = [], []
+        for action in sorted(action_positions.keys()):
+            if any(df['action'] == action):
+                handles.append(plt.Rectangle((0, 0), 1, 1, color=action_colors[action], alpha=0.7))
+                labels.append(action_labels[action])
+        
+        # plt.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
+        
+        plt.tight_layout()
+        plt.savefig(f'battery_actions_soc_episode_{episode_num}.png')
+        plt.show()
+        
+        # Print additional statistics
+        print(f"\nDetailed Statistics for Episode {episode_num}:")
+        print(f"Total Cost: {results[episode_num]['total_cost']:.2f} pence")
+        print(f"Average SOC: {average_soc:.2f}%")
+        print(f"Battery Charges: {charge_count}")
+        print(f"Battery Discharges: {discharge_count}")
+        print(f"Peak Hour Discharges: {peak_discharges} ({peak_discharges/max(1, discharge_count)*100:.1f}% of all discharges)")
+        print(f"Time in Optimal SOC Range ({optimal_min}%-{optimal_max}%): {time_in_optimal_range:.1f}%")
+        
+    def plot_solar_vs_battery_strategy(self, results, episode_num=0):
+        """
+        Plot how the agent manages solar generation in relation to battery charging/discharging.
+        
+        Parameters:
+        -----------
+        results: list
+            Evaluation results from the evaluate method
+        episode_num: int
+            Index of the episode to plot (default: 0)
+        """
+        if not results or episode_num >= len(results):
+            print(f"No evaluation results for episode {episode_num}.")
+            return
+        
+        # Get data for the specified episode
+        episode_data = results[episode_num]['steps']
+        
+        # Convert to DataFrame for easier plotting
+        df = pd.DataFrame(episode_data)
+        
+        # Create figure with multiple subplots
+        fig, axs = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+        
+        # Plot solar generation and usage
+        axs[0].plot(df['time_step'], df['solar_generation'], 'yellow', linewidth=2, label='Solar Generation')
+        axs[0].plot(df['time_step'], df['solar_used'], 'orange', linewidth=2, label='Solar Used')
+        axs[0].fill_between(df['time_step'], df['solar_generation'], df['solar_used'], 
+                           color='yellow', alpha=0.3, label='Unused/Exported')
+        axs[0].set_ylabel('Energy (kWh)')
+        axs[0].set_title('Solar Generation and Usage Strategy', fontsize=14)
+        axs[0].legend()
+        axs[0].grid(True, alpha=0.3)
+        
+        # Plot battery state of charge
+        axs[1].plot(df['time_step'], df['battery_soc'], 'b-', linewidth=2.5)
+        axs[1].set_ylabel('Battery SOC (%)')
+        axs[1].set_ylim(0, 100)
+        axs[1].grid(True, alpha=0.3)
+        
+        # Add horizontal dotted lines for SOC constraints
+        axs[1].axhline(y=self.env.min_soc, color='gray', linestyle=':', alpha=0.7, 
+                      label=f'Min SOC ({self.env.min_soc}%)')
+        axs[1].axhline(y=self.env.max_soc, color='gray', linestyle=':', alpha=0.7,
+                      label=f'Max SOC ({self.env.max_soc}%)')
+        axs[1].legend()
+        
+        # Plot grid interaction
+        axs[2].plot(df['time_step'], df['grid_import'], 'red', linewidth=2, label='Grid Import')
+        axs[2].plot(df['time_step'], -df['grid_export'], 'green', linewidth=2, label='Grid Export (negative)')
+        axs[2].set_ylabel('Grid Energy (kWh)')
+        axs[2].set_xlabel('Hour of Day')
+        axs[2].set_xlim(-0.5, 23.5)
+        axs[2].set_xticks(range(0, 24, 2))
+        axs[2].legend()
+        axs[2].grid(True, alpha=0.3)
+        
+        # Color code the background based on action type
+        for i, row in df.iterrows():
+            time_step = row['time_step']
+            action = row['action']
+            
+            # Define colors for different actions
+            action_colors = {
+                0: 'white',      # Do nothing
+                1: 'lightcoral', # Discharge battery
+                2: 'lightgreen', # Charge battery from PV
+                3: 'lightskyblue' # Export PV to grid
+            }
+            
+            # Add colored background
+            for ax in axs:
+                ax.axvspan(time_step - 0.5, time_step + 0.5, 
+                          alpha=0.2, color=action_colors[action])
+        
+        # Add a text box with summary statistics
+        solar_utilization = (df['solar_used'].sum() / df['solar_generation'].sum() * 100) if df['solar_generation'].sum() > 0 else 0
+        
+        action_counts = df['action'].value_counts().to_dict()
+        for action in range(4):
+            if action not in action_counts:
+                action_counts[action] = 0
+        
+        stats_text = (f"Episode {episode_num} Summary:\n"
+                     f"Total Solar Generation: {df['solar_generation'].sum():.2f} kWh\n"
+                     f"Solar Utilization: {solar_utilization:.1f}%\n"
+                     f"Total Grid Import: {df['grid_import'].sum():.2f} kWh\n"
+                     f"Total Grid Export: {df['grid_export'].sum():.2f} kWh\n"
+                     f"Do Nothing: {action_counts.get(0, 0)} hrs\n"
+                     f"Discharge: {action_counts.get(1, 0)} hrs\n"
+                     f"Charge from PV: {action_counts.get(2, 0)} hrs\n"
+                     f"Export PV: {action_counts.get(3, 0)} hrs\n")
+        
+        # Add the text box to the first subplot
+        axs[0].text(0.02, 0.97, stats_text, transform=axs[0].transAxes, 
+                   verticalalignment='top', bbox=dict(boxstyle='round', 
+                   facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig(f'solar_battery_strategy_episode_{episode_num}.png')
+        plt.show()
+        
+    def visualize_theoretical_min_cost(env, actions_log):
+        """
+        Visualize the theoretical minimum cost strategy.
+        """
+        
+        # Convert actions log to DataFrame for easier plotting
+        df = pd.DataFrame(actions_log)
+        
+        # Create a figure with multiple subplots
+        fig, axs = plt.subplots(3, 1, figsize=(12, 15))
+        
+        # Plot battery SOC
+        axs[0].plot(df['hour'], df['battery_soc'], 'b-', linewidth=2.5)
+        axs[0].set_ylabel('Battery State of Charge (%)')
+        axs[0].set_ylim(0, 100)
+        axs[0].set_title('Theoretical Minimum Cost Strategy', fontsize=14)
+        axs[0].grid(True, alpha=0.3)
+        
+        # Highlight peak hours
+        for hour in df[df['is_peak']]['hour']:
+            axs[0].axvspan(hour, hour+1, alpha=0.2, color='yellow')
+        
+        # Plot grid import
+        axs[1].bar(df['hour'], df['grid_import'], color='purple', alpha=0.7)
+        axs[1].set_ylabel('Grid Import (kWh)')
+        axs[1].grid(True, alpha=0.3)
+        
+        # Plot costs
+        axs[2].bar(df['hour'], df['cost'], color='green', alpha=0.7)
+        axs[2].set_ylabel('Cost (pence)')
+        axs[2].set_xlabel('Hour of Day')
+        axs[2].set_xlim(-0.5, 23.5)
+        axs[2].set_xticks(range(0, 24, 4))
+        axs[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('theoretical_min_cost.png')
+        plt.show()
+        
+    def plot_energy_flow_visualization(self, results, episode_num=0):
+        """
+        Create a detailed visualization showing load demand profiles, excess PV generation, 
+        and battery SOC over a 24-hour period.
+        
+        Parameters:
+        -----------
+        results: list
+            Evaluation results from the evaluate method
+        episode_num: int
+            Index of the episode to plot (default: 0)
+        """
+        if not results or episode_num >= len(results):
+            print(f"No evaluation results for episode {episode_num}.")
+            return
+        
+        # Get data for the specified episode
+        episode_data = results[episode_num]['steps']
+        
+        # Convert to DataFrame for easier plotting
+        df = pd.DataFrame(episode_data)
+        
+        # Create figure with multiple subplots
+        fig, axs = plt.subplots(3, 1, figsize=(14, 16), gridspec_kw={'height_ratios': [2, 1, 1]})
+        
+        # Calculate metrics for additional columns in the DataFrame
+        df['pv_to_load'] = df.apply(lambda row: min(row['solar_generation'], row['grid_import'] + row['battery_change']), axis=1)
+        df['excess_pv'] = df.apply(lambda row: max(0, row['solar_generation'] - row['pv_to_load']), axis=1)
+        df['remaining_load'] = df.apply(lambda row: max(0, row['grid_import'] - row['solar_used']), axis=1)
+        
+        # Calculate summary statistics
+        total_solar = df['solar_generation'].sum()
+        pv_to_load = df['pv_to_load'].sum()
+        excess_pv = df['excess_pv'].sum()
+        remaining_load = df['remaining_load'].sum()
+        solar_utilization = (df['solar_used'].sum() / total_solar * 100) if total_solar > 0 else 0
+        peak_soc = df['battery_soc'].max()
+        
+        # Plot 1: PV Generation, Load, and Energy Flow
+        ax1 = axs[0]
+        
+        # Fill area for solar generation
+        ax1.fill_between(df['time_step'], 0, df['solar_generation'], color='#FFEB3B', alpha=0.6, label='Solar Generation')
+        
+        # Add stacked bars for energy flow
+        bar_width = 0.6
+        ax1.bar(df['time_step'], df['pv_to_load'], bar_width, color='#4CAF50', label='PV to Load')
+        ax1.bar(df['time_step'], df['excess_pv'], bar_width, bottom=df['pv_to_load'], color='#2196F3', label='Excess PV')
+        ax1.bar(df['time_step'] + bar_width/1.5, df['remaining_load'], bar_width/1.5, color='#FF5722', label='Remaining Load')
+        
+        # Add line for load demand
+        load_demand = df['grid_import'] + df['solar_used'] - df['battery_change']
+        ax1.plot(df['time_step'], load_demand, 'r-', linewidth=2.5, label='Load Demand')
+        
+        # Add dashed line for average load
+        avg_load = load_demand.mean()
+        ax1.axhline(y=avg_load, color='darkred', linestyle='--', linewidth=1.5, label=f'Avg Load ({avg_load:.2f} kWh)')
+        
+        # Configure plot
+        ax1.set_title('Microgrid Energy Flow', fontsize=16)
+        ax1.set_ylabel('Energy (kWh)', fontsize=12)
+        ax1.set_xlim(-0.5, 23.5)
+        ax1.set_xticks(range(0, 24, 2))
+        ax1.grid(True, alpha=0.3)
+        ax1.legend(loc='upper right', fontsize=10)
+        
+        # Add text box with summary
+        summary_text = (
+            f"Energy Flow Summary:\n"
+            f"Total Solar Generation: {total_solar:.2f} kWh\n"
+            f"PV Directly to Load: {pv_to_load:.2f} kWh\n"
+            f"Excess PV: {excess_pv:.2f} kWh\n"
+            f"Load Not Met by PV: {remaining_load:.2f} kWh\n"
+            f"Solar Utilization Rate: {solar_utilization:.1f}%"
+        )
+        
+        ax1.text(0.02, 0.97, summary_text, transform=ax1.transAxes, 
+                 verticalalignment='top', bbox=dict(boxstyle='round', 
+                 facecolor='white', alpha=0.9), fontsize=10)
+        
+        # Plot 2: Battery State of Charge
+        ax2 = axs[1]
+        
+        # Plot battery SOC
+        ax2.plot(df['time_step'], df['battery_soc'], 'purple', linewidth=3, label='Battery SOC')
+        
+        # Add horizontal dotted lines for SOC constraints
+        ax2.axhline(y=self.env.min_soc, color='purple', linestyle=':', alpha=0.7, 
+                    label=f'Min SOC ({self.env.min_soc}%)')
+        ax2.axhline(y=self.env.max_soc, color='purple', linestyle=':', alpha=0.7,
+                    label=f'Max SOC ({self.env.max_soc}%)')
+        
+        # Configure plot
+        ax2.set_title('Battery State of Charge', fontsize=16)
+        ax2.set_ylabel('SOC (%)', fontsize=12)
+        ax2.set_xlim(-0.5, 23.5)
+        ax2.set_xticks(range(0, 24, 2))
+        ax2.set_ylim(0, 100)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper right', fontsize=10)
+        
+        # Add text with battery statistics
+        battery_text = (
+            f"Battery Statistics:\n"
+            f"Starting SOC: {df.iloc[0]['battery_soc']:.1f}%\n"
+            f"Ending SOC: {df.iloc[-1]['battery_soc']:.1f}%\n"
+            f"Peak SOC: {peak_soc:.1f}%\n"
+            f"Total Charge Cycles: {len(df[df['battery_change'] > 0])}\n"
+            f"Total Discharge Cycles: {len(df[df['battery_change'] < 0])}"
+        )
+        
+        ax2.text(0.02, 0.97, battery_text, transform=ax2.transAxes, 
+                 verticalalignment='top', bbox=dict(boxstyle='round', 
+                 facecolor='white', alpha=0.9), fontsize=10)
+        
+        # Plot 3: Action Distribution and Grid Interaction
+        ax3 = axs[2]
+        
+        # Plot grid imports and exports
+        ax3.bar(df['time_step'], df['grid_import'], color='red', alpha=0.7, label='Grid Import')
+        ax3.bar(df['time_step'], -df['grid_export'], color='green', alpha=0.7, label='Grid Export (negative)')
+        
+        # Add color coding for actions
+        for i, row in df.iterrows():
+            time_step = row['time_step']
+            action = row['action']
+            
+            # Define colors for different actions
+            action_colors = {
+                0: 'white',      # Do nothing
+                1: 'lightcoral', # Discharge battery
+                2: 'lightgreen', # Charge battery from PV
+                3: 'lightskyblue' # Export PV to grid
+            }
+            
+            # Add colored background
+            ax3.axvspan(time_step - 0.5, time_step + 0.5, 
+                        alpha=0.3, color=action_colors.get(action, 'white'))
+        
+        # Configure plot
+        ax3.set_title('Grid Interaction and Controller Actions', fontsize=16)
+        ax3.set_xlabel('Hour of Day', fontsize=12)
+        ax3.set_ylabel('Grid Energy (kWh)', fontsize=12)
+        ax3.set_xlim(-0.5, 23.5)
+        ax3.set_xticks(range(0, 24, 2))
+        ax3.grid(True, alpha=0.3)
+        
+        # Create custom legend for actions
+        from matplotlib.patches import Patch
+        action_patches = [
+            Patch(color='white', alpha=0.3, label='Do Nothing'),
+            Patch(color='lightcoral', alpha=0.3, label='Discharge Battery'),
+            Patch(color='lightgreen', alpha=0.3, label='Charge from PV'),
+            Patch(color='lightskyblue', alpha=0.3, label='Export PV to Grid')
+        ]
+        
+        # Combine both legends
+        ax3.legend(handles=[*ax3.get_legend_handles_labels()[0], *action_patches], 
+                   loc='upper right', fontsize=10)
+        
+        # Add text with grid interaction statistics
+        grid_text = (
+            f"Grid Interaction:\n"
+            f"Total Import: {df['grid_import'].sum():.2f} kWh\n"
+            f"Total Export: {df['grid_export'].sum():.2f} kWh\n"
+            f"Net Grid Energy: {(df['grid_import'].sum() - df['grid_export'].sum()):.2f} kWh\n"
+            f"Peak Import: {df['grid_import'].max():.2f} kWh at hour {df.loc[df['grid_import'].idxmax(), 'time_step']}\n"
+            f"Peak Export: {df['grid_export'].max():.2f} kWh at hour {df.loc[df['grid_export'].idxmax(), 'time_step']}"
+        )
+        
+        ax3.text(0.02, 0.97, grid_text, transform=ax3.transAxes, 
+                 verticalalignment='top', bbox=dict(boxstyle='round', 
+                 facecolor='white', alpha=0.9), fontsize=10)
+        
+        # Add overall title
+        fig.suptitle(f'Microgrid Energy Flow Visualization - Episode {episode_num}', 
+                     fontsize=20, y=0.98)
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.94)
+        plt.savefig(f'microgrid_energy_flow_episode_{episode_num}.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        # Print additional insights
+        print("\nKey Insights from Energy Flow Analysis:")
+        print(f"1. Solar Utilization: Only {solar_utilization:.1f}% of available solar energy is utilized directly.")
+        print(f"2. Battery Usage: The battery maintains a minimum SOC of {df['battery_soc'].min():.1f}% most of the day with peak SOC of {peak_soc:.1f}%.")
+        print(f"3. Grid Dependency: {(df['grid_import'].sum() / load_demand.sum() * 100):.1f}% of total load is met by grid imports.")
+        print(f"4. Export Ratio: {(df['grid_export'].sum() / df['solar_generation'].sum() * 100):.1f}% of solar generation is exported to the grid.")
+        
+        # Return the DataFrame for further analysis if needed
+        return df
+        
+    def compare_with_persistent_theoretical_min(self, agent, num_days=5, evaluation_episodes=1):
+        """
+        Compare the Q-learning agent's performance with the theoretical minimum cost
+        when battery state is persistent between days.
+        
+        Parameters:
+        -----------
+        agent: QLearning
+            The trained Q-learning agent
+        num_days: int
+            Number of days to simulate for the theoretical minimum calculation
+        evaluation_episodes: int
+            Number of episodes to evaluate the agent
+            
+        Returns:
+        --------
+        comparison_results: dict
+            Dictionary containing comparison metrics
+        """
+        print("Calculating theoretical minimum cost with persistent battery...")
+        theoretical_cost, actions_log, final_battery = self.calculate_persistent_theoretical_min_cost(days=num_days, initial_soc=0)
+            
+        # Reset the environment and set the battery to the same initial SOC
+        self.battery_charge = 0  # Start with 0% SOC for fair comparison
+        self.time_step = 0
+        self.total_cost = 0
+        
+        # Evaluate the agent
+        print("\nEvaluating Q-learning agent with the same initial conditions...")
+        results = agent.evaluate(num_episodes=evaluation_episodes)
+        
+        if not results:
+            print("No evaluation results available.")
+            return None
+        
+        q_learning_cost = results[0]['total_cost']
+        q_learning_actions = results[0]['steps']
+        
+        # Convert agent actions to DataFrame for easier comparison
+        agent_df = pd.DataFrame(q_learning_actions)
+        theoretical_df = pd.DataFrame(actions_log)
+        
+        # Calculate differences
+        cost_difference = q_learning_cost - theoretical_cost
+        percentage_difference = (cost_difference / theoretical_cost) * 100
+        
+        # Print comparison
+        print("\nComparison with Persistent Theoretical Minimum:")
+        print(f"Theoretical Minimum Cost: {theoretical_cost:.2f} pence")
+        print(f"Q-Learning Agent Cost: {q_learning_cost:.2f} pence")
+        print(f"Difference: +{cost_difference:.2f} pence (+{percentage_difference:.2f}%)")
+        
+        # Create a visualization comparing the two approaches
+        fig, axs = plt.subplots(3, 1, figsize=(12, 15))
+        
+        # Plot battery state of charge over time
+        axs[0].plot(theoretical_df['hour'], theoretical_df['battery_soc'], 'b-', label='Theoretical Optimal', linewidth=2.5)
+        agent_soc = (agent_df['battery_charge'] / self.battery_capacity) * 100
+        axs[0].plot(agent_df['time_step'], agent_soc, 'r--', label='Q-Learning Agent', linewidth=2)
+        axs[0].set_ylabel('Battery State of Charge (%)')
+        axs[0].set_title('Comparison of Battery Management Strategies', fontsize=14)
+        axs[0].legend()
+        axs[0].grid(True, alpha=0.3)
+        
+        # Highlight peak hours
+        peak_hours_morning = list(range(7, 11))
+        peak_hours_evening = list(range(17, 21))
+        for hour in peak_hours_morning + peak_hours_evening:
+            axs[0].axvspan(hour, hour+1, alpha=0.2, color='yellow')
+        
+        # Plot grid import over time
+        axs[1].plot(theoretical_df['hour'], theoretical_df['grid_import'], 'b-', label='Theoretical Optimal', linewidth=2.5)
+        axs[1].plot(agent_df['time_step'], agent_df['grid_import'], 'r--', label='Q-Learning Agent', linewidth=2)
+        axs[1].set_ylabel('Grid Import (kWh)')
+        axs[1].legend()
+        axs[1].grid(True, alpha=0.3)
+        
+        # Highlight peak hours for grid import as well
+        for hour in peak_hours_morning + peak_hours_evening:
+            axs[1].axvspan(hour, hour+1, alpha=0.2, color='yellow')
+        
+        # Plot hourly costs
+        axs[2].plot(theoretical_df['hour'], theoretical_df['cost'], 'b-', label='Theoretical Optimal', linewidth=2.5)
+        axs[2].plot(agent_df['time_step'], agent_df['cost'], 'r--', label='Q-Learning Agent', linewidth=2)
+        axs[2].set_ylabel('Hourly Cost (pence)')
+        axs[2].set_xlabel('Hour of Day')
+        axs[2].legend()
+        axs[2].grid(True, alpha=0.3)
+        
+        # Highlight peak hours for costs as well
+        for hour in peak_hours_morning + peak_hours_evening:
+            axs[2].axvspan(hour, hour+1, alpha=0.2, color='yellow')
+        
+        plt.tight_layout()
+        plt.savefig('persistent_comparison.png')
+        plt.show()
+        
+        # Calculate detailed comparison metrics
+        comparison_metrics = {
+            'theoretical_cost': theoretical_cost,
+            'q_learning_cost': q_learning_cost,
+            'absolute_difference': cost_difference,
+            'percentage_difference': percentage_difference,
+            'peak_hour_grid_import': {
+                'theoretical': theoretical_df[theoretical_df['is_peak']]['grid_import'].sum(),
+                'q_learning': agent_df[agent_df['is_peak']]['grid_import'].sum(),
+            },
+            'off_peak_grid_import': {
+                'theoretical': theoretical_df[~theoretical_df['is_peak']]['grid_import'].sum(),
+                'q_learning': agent_df[~agent_df['is_peak']]['grid_import'].sum(),
+            },
+            'battery_usage': {
+                'theoretical': theoretical_df['battery_change'].abs().sum(),
+                'q_learning': agent_df['battery_change'].abs().sum(),
+            },
+            'discharge_during_peak': {
+                'theoretical': sum(1 for i, row in theoretical_df.iterrows() if row['is_peak'] and row['action'] == 2),
+                'q_learning': sum(1 for i, row in agent_df.iterrows() if row['is_peak'] and row['action'] == 2),
+            },
+            'charge_during_off_peak': {
+                'theoretical': sum(1 for i, row in theoretical_df.iterrows() if not row['is_peak'] and row['action'] == 1),
+                'q_learning': sum(1 for i, row in agent_df.iterrows() if not row['is_peak'] and row['action'] == 1),
+            }
+        }
+        
+        # Print detailed comparison
+        print("\nDetailed Performance Comparison:")
+        print(f"Peak Hour Grid Import: Theoretical = {comparison_metrics['peak_hour_grid_import']['theoretical']:.2f} kWh, " +
+              f"Q-Learning = {comparison_metrics['peak_hour_grid_import']['q_learning']:.2f} kWh")
+        print(f"Off-Peak Grid Import: Theoretical = {comparison_metrics['off_peak_grid_import']['theoretical']:.2f} kWh, " +
+              f"Q-Learning = {comparison_metrics['off_peak_grid_import']['q_learning']:.2f} kWh")
+        print(f"Total Battery Usage: Theoretical = {comparison_metrics['battery_usage']['theoretical']:.2f} kWh, " +
+              f"Q-Learning = {comparison_metrics['battery_usage']['q_learning']:.2f} kWh")
+        print(f"Discharges During Peak: Theoretical = {comparison_metrics['discharge_during_peak']['theoretical']}, " +
+              f"Q-Learning = {comparison_metrics['discharge_during_peak']['q_learning']}")
+        print(f"Charges During Off-Peak: Theoretical = {comparison_metrics['charge_during_off_peak']['theoretical']}, " +
+              f"Q-Learning = {comparison_metrics['charge_during_off_peak']['q_learning']}")
+        
+        return comparison_metrics
+
+    def compare_with_q_learning(env, agent, theoretical_cost, actions_log):
+        """
+        Compare the Q-learning agent's performance with the theoretical minimum cost.
+        """
+        # Evaluate the Q-learning agent
+        env.reset()
+        results = agent.evaluate(num_episodes=1)
+        
+        if not results:
+            print("No evaluation results available.")
+            return None
+        
+        q_learning_cost = results[0]['total_cost']
+        
+        # Calculate differences
+        cost_difference = q_learning_cost - theoretical_cost
+        percentage_difference = (cost_difference / theoretical_cost) * 100
+        
+        # Print comparison
+        print("\nComparison with Q-Learning Agent:")
+        print(f"Theoretical Minimum Cost: {theoretical_cost:.2f} pence")
+        print(f"Q-Learning Agent Cost: {q_learning_cost:.2f} pence")
+        print(f"Difference: +{cost_difference:.2f} pence (+{percentage_difference:.2f}%)")
+        
+        return {
+            'theoretical_cost': theoretical_cost,
+            'q_learning_cost': q_learning_cost,
+            'absolute_difference': cost_difference,
+            'percentage_difference': percentage_difference
+        }
+        
+    def plot_convergence_to_minimum(agent, theoretical_cost, evaluate_interval=100, num_episodes=5000, smoothing_window=100):
+        """
+        Track and visualize how the agent's cost converges toward the theoretical minimum cost
+        over training episodes.
+        
+        Parameters:
+        -----------
+        agent: QLearning
+            The Q-learning agent to train and evaluate
+        theoretical_cost: float
+            The theoretical minimum cost calculated from calculate_theoretical_min_cost
+        evaluate_interval: int
+            Number of episodes between evaluations
+        num_episodes: int
+            Total number of episodes for training
+        
+        Returns:
+        --------
+        convergence_data: dict
+            Dictionary containing convergence metrics and data
+        """
+        
+        episode_costs = agent.episode_costs
+        num_episodes = len(episode_costs)
+        
+        # Calculate metrics
+        episode_numbers = list(range(1, num_episodes + 1))
+        cost_differences = [cost - theoretical_cost for cost in episode_costs]
+        percentage_differences = [(diff / theoretical_cost) * 100 for diff in cost_differences]
+        
+        # Apply smoothing for better visualization
+        if num_episodes > smoothing_window:
+            # Use moving average for smoothing
+            def moving_average(data, window_size):
+                return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+            
+            smoothed_costs = moving_average(episode_costs, smoothing_window)
+            smoothed_percentages = moving_average(percentage_differences, smoothing_window)
+            smoothed_episodes = list(range(smoothing_window, num_episodes + 1))
+        else:
+            smoothed_costs = episode_costs
+            smoothed_percentages = percentage_differences
+            smoothed_episodes = episode_numbers
+        
+        # Create convergence plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        
+        # Plot costs over episodes (raw and smoothed)
+        ax1.plot(episode_numbers, episode_costs, 'b-', alpha=0.3, label='Episode Cost')
+        ax1.plot(smoothed_episodes, smoothed_costs, 'r-', linewidth=2, label='Smoothed Cost')
+        ax1.axhline(y=theoretical_cost, color='g', linestyle='--', label='Theoretical Minimum')
+        
+        ax1.set_title('Convergence to Theoretical Minimum Cost (All Training Episodes)', fontsize=14)
+        ax1.set_ylabel('Cost (pence)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot percentage difference from theoretical minimum
+        ax2.plot(episode_numbers, percentage_differences, 'b-', alpha=0.3, label='% Difference')
+        ax2.plot(smoothed_episodes, smoothed_percentages, 'r-', linewidth=2, label='Smoothed % Difference')
+        ax2.set_xlabel('Training Episodes')
+        ax2.set_ylabel('% Above Theoretical Minimum')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Add reference line at 0%
+        ax2.axhline(y=0, color='g', linestyle='--')
+        
+        # Calculate convergence metrics
+        final_cost = episode_costs[-1]
+        final_gap = percentage_differences[-1]
+        
+        # Find when the agent converges to within 5% of the theoretical minimum
+        convergence_threshold = 5.0  # 5% above theoretical minimum
+        convergence_episodes = [ep for ep, pct in enumerate(percentage_differences) if pct <= convergence_threshold]
+        convergence_episode = convergence_episodes[0] if convergence_episodes else None
+        
+        # Add convergence point if found
+        if convergence_episode is not None:
+            ax2.axvline(x=convergence_episode, color='purple', linestyle=':', linewidth=2)
+            ax2.annotate(f'5% Convergence: Episode {convergence_episode}',
+                        xy=(convergence_episode, percentage_differences[convergence_episode]),
+                        xytext=(convergence_episode + num_episodes * 0.05, 
+                                percentage_differences[convergence_episode] + 10),
+                        arrowprops=dict(arrowstyle='->'))
+        
+        # Add text box with summary statistics
+        stats_text = (f"Convergence Summary:\n"
+                     f"Starting Cost: {episode_costs[0]:.2f} pence\n"
+                     f"Final Cost: {final_cost:.2f} pence\n"
+                     f"Theoretical Minimum: {theoretical_cost:.2f} pence\n"
+                     f"Final Gap: {final_gap:.2f}%\n")
+        
+        if convergence_episode is not None:
+            stats_text += f"5% Convergence: Episode {convergence_episode}"
+        
+        ax1.text(0.05, 0.95, stats_text, transform=ax1.transAxes, 
+                verticalalignment='top', bbox=dict(boxstyle='round', 
+                facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig('training_convergence_to_minimum.png')
+        plt.show()
+        
+        # Return convergence data
+        convergence_data = {
+            'episode_numbers': episode_numbers,
+            'costs': episode_costs,
+            'smoothed_costs': smoothed_costs.tolist(),
+            'percentage_differences': percentage_differences,
+            'smoothed_percentages': smoothed_percentages.tolist(),
+            'theoretical_minimum': theoretical_cost,
+            'final_gap_percent': final_gap,
+            'convergence_episode': convergence_episode
+        }
+        
+        return convergence_data
+
+# Example usage
+if __name__ == "__main__":
+    # Create microgrid environment
+    env = Microgrid()
+    
+    # Calculate theoretical minimum cost with solar PV
+    print("Calculating theoretical minimum cost with solar PV...")
+    theoretical_cost, actions_log, final_battery_charge = env.calculate_theoretical_min_cost(days=3)
+    
+    # Create and train a Q-learning agent
+    agent = QLearning(env, learning_rate=0.1, discount_factor=0.99, 
+                     exploration_rate=1.0, exploration_decay=0.9995)
+    
+    # Train the agent
+    print("\nTraining Q-learning agent...")
+    training_metrics = agent.train(num_episodes=20000, evaluate_interval=500)
+    
+    # Plot training metrics
+    agent.plot_training_metrics()
+    
+    # Evaluate the agent
+    print("\nEvaluating trained agent...")
+    evaluation_results = agent.evaluate(num_episodes=3)
+    
+    # Plot evaluation results
+    agent.plot_evaluation_results(evaluation_results)
+    
+    # Plot solar and battery strategy
+    agent.plot_solar_vs_battery_strategy(evaluation_results, episode_num=0)
+    
+    agent.plot_energy_flow_visualization(evaluation_results, episode_num=0)
+    
+    # Compare with theoretical minimum
+    print("\nComparing with theoretical minimum cost...")
+    comparison = QLearning.compare_with_q_learning(env, agent, theoretical_cost, actions_log)
+    
+    # Visualize the theoretical minimum cost strategy
+    QLearning.visualize_theoretical_min_cost(env, actions_log)
+    
+    # Optional: Plot convergence to minimum
+    print("\nPlotting convergence to theoretical minimum...")
+    convergence_data = QLearning.plot_convergence_to_minimum(
+        agent, 
+        theoretical_cost, 
+        evaluate_interval=100,
+        num_episodes=20000
+    )
+    
+    print("\nAnalysis complete!")
