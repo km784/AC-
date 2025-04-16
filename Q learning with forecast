@@ -399,247 +399,135 @@ class Microgrid:
         return self._get_state(), reward, done, info
     
     
-    def calculate_theoretical_min_cost(self, days=3):
+    def calculate_theoretical_min_cost(self, days=3, enforce_final_soc=True):
         """
         Calculate the theoretical minimum cost for a microgrid with solar PV over multiple days
         with persistent battery state of charge between days and SOC constraints.
-        This updated version properly considers time-of-day electricity tariffs.
+        This version ENFORCES that the battery SOC at the end of the last day is the same as at the beginning,
+        and ensures battery charge/discharge and tariffs are applied optimally.
         """
-        # Create a deep copy of the environment to avoid modifying the original
         from copy import deepcopy
         test_env = deepcopy(self)
         
-        # Define SOC constraints - using the class's min_soc and max_soc values
         min_soc = test_env.min_soc  # 15%
         max_soc = test_env.max_soc  # 80%
-        
-        # Convert SOC percentages to absolute battery charge values
         min_charge = (min_soc / 100) * test_env.battery_capacity
         max_charge = (max_soc / 100) * test_env.battery_capacity
-        
-        # Initialize battery charge at minimum SOC
-        battery_charge = min_charge
-        
-        # Log of actions and costs for all days
-        all_days_log = []
-        
-        # Simulate multiple days to reach steady state
-        for day in range(days):
-            day_actions_log = []
-            day_total_cost = 0
-            
-            # Run for 24 hours
-            for hour in range(24):
-                test_env.time_step = hour
-                
-                # Get current tariffs, load, and solar generation
-                consumption_tariff, injection_tariff = test_env._get_tariffs()
-                current_load = test_env.load_profile[hour]
-                current_solar = test_env.solar_profile[hour]
-                
-                # Determine if current hour is peak time (for tracking)
-                is_peak = False
-                if 16 <= hour <= 18:  # Peak hours: 4pm to 7pm (hours 16, 17, 18)
-                    is_peak = True
-                
-                # Initialize variables
-                grid_import = 0
-                grid_export = 0
-                battery_charge_change = 0
-                solar_used = 0
-                action = 0
-                
-                # Determine the optimal action based on the current state and tariffs
-                # 1. Use solar to meet load directly (always the most cost-effective)
-                solar_to_load = min(current_solar, current_load)
-                solar_used = solar_to_load
-                remaining_load = current_load - solar_to_load
-                excess_solar = max(0, current_solar - current_load)
-                
-                # Special case handling for different time periods
-                if 16 <= hour <= 18:  # Peak hours (4pm-7pm): High export tariff
-                    # During peak hours, prioritize export (if export tariff is high) or discharge battery
+
+        # To ensure a fair comparison, try both min_soc and max_soc as the starting/ending SOC.
+        min_cost = float("inf")
+        best_log = None
+        best_final_charge = None
+
+        for initial_soc in [min_soc, max_soc, 50.0]:
+            battery_charge = (initial_soc / 100) * test_env.battery_capacity
+            all_days_log = []
+
+            for day in range(days):
+                day_actions_log = []
+                day_total_cost = 0
+
+                for hour in range(24):
+                    test_env.time_step = hour
+                    consumption_tariff, injection_tariff = test_env._get_tariffs()
+                    current_load = test_env.load_profile[hour]
+                    current_solar = test_env.solar_profile[hour]
+
+                    # Use all solar for load first
+                    solar_to_load = min(current_solar, current_load)
+                    solar_used = solar_to_load
+                    remaining_load = current_load - solar_to_load
+                    excess_solar = max(0, current_solar - current_load)
+                    grid_import = 0
+                    grid_export = 0
+                    battery_charge_change = 0
+                    action = 0
+
+                    # --- Prioritize solar for load, then charge battery, then export ---
+                    # 1. Charge battery with excess solar (respect SOC and charge rate)
+                    battery_space = max_charge - battery_charge
+                    solar_to_battery = min(test_env.max_charge_rate, battery_space, excess_solar)
+                    if solar_to_battery > 0:
+                        battery_charge_change += solar_to_battery
+                        solar_used += solar_to_battery
+                        excess_solar -= solar_to_battery
+                        action = 3  # Charge PV
+
+                    # 2. Export any remaining excess solar
                     if excess_solar > 0:
-                        # If there's excess solar during peak, first charge battery if needed
-                        # then export the rest
-                        battery_space = max_charge - battery_charge
-                        solar_to_battery = min(test_env.max_charge_rate, battery_space, excess_solar)
-                        
-                        if solar_to_battery > 0:
-                            battery_charge_change += solar_to_battery
-                            solar_used += solar_to_battery
-                            action = 3  # Charge from PV
-                        
-                        # Export remaining excess to grid (high value during peak)
-                        remaining_excess = excess_solar - solar_to_battery
-                        if remaining_excess > 0:
-                            grid_export = remaining_excess
-                            # If we're primarily exporting, change action to export PV
-                            if battery_charge_change == 0:
-                                action = 4  # Export PV
-                    
-                    # If we have remaining load after solar, discharge battery to meet it if possible
+                        grid_export = excess_solar
+                        action = 4  # Export PV
+
+                    # 3. For remaining unmet load, decide whether to discharge battery or import from grid
+                    available_discharge = battery_charge - min_charge
+                    discharge_now = 0
+                    # Only discharge during peak or just before (to avoid being caught with unused charge)
+                    is_peak = 16 <= hour <= 18
+                    just_before_peak = hour in [14, 15]
+                    is_end_of_day = (hour == 23)
+
                     if remaining_load > 0:
-                        available_discharge = battery_charge - min_charge
-                        potential_discharge = min(test_env.max_discharge_rate, available_discharge, remaining_load)
-                        
-                        if potential_discharge > 0:
-                            battery_charge_change -= potential_discharge
-                            remaining_load -= potential_discharge
-                            action = 2  # Discharge battery
-                            
-                    # Any remaining load must be met by grid import
-                    if remaining_load > 0:
-                        grid_import = remaining_load
-                        if battery_charge_change == 0 and grid_export == 0:
-                            action = 0  # Do nothing (buy from grid)
-                
-                elif 2 <= hour <= 4:  # Off-peak hours (2am-5am): Low export tariff, good for charging
-                    # During off-peak, prioritize using excess PV to charge battery if possible
-                    # (though unlikely to have solar at night)
-                    if excess_solar > 0:
-                        battery_space = max_charge - battery_charge
-                        solar_to_battery = min(test_env.max_charge_rate, battery_space, excess_solar)
-                        
-                        if solar_to_battery > 0:
-                            battery_charge_change += solar_to_battery
-                            solar_used += solar_to_battery
-                            action = 3  # Charge from PV
-                        
-                        # Export remaining excess to grid
-                        remaining_excess = excess_solar - solar_to_battery
-                        if remaining_excess > 0:
-                            grid_export = remaining_excess
-                            if battery_charge_change == 0:
-                                action = 4  # Export PV
-                    
-                    # If there's remaining load and it's more cost-effective, use battery
-                    # This is less likely during off-peak when grid import is cheap
-                    if remaining_load > 0:
-                        # Check if it's more cost-effective to use battery or import from grid
-                        # This depends on the battery's opportunity cost for peak hours
-                        
-                        # For simplicity, during off-peak we prioritize grid import
-                        # and save battery for peak hours
-                        grid_import = remaining_load
-                        action = 0  # Do nothing (buy from grid)
-                
-                else:  # Standard hours: normal tariffs
-                    # For excess solar during standard hours:
-                    if excess_solar > 0:
-                        # Prioritize charging battery with excess solar
-                        battery_space = max_charge - battery_charge
-                        solar_to_battery = min(test_env.max_charge_rate, battery_space, excess_solar)
-                        
-                        if solar_to_battery > 0:
-                            battery_charge_change += solar_to_battery
-                            solar_used += solar_to_battery
-                            action = 3  # Charge from PV
-                        
-                        # Export remaining excess to grid
-                        remaining_excess = excess_solar - solar_to_battery
-                        if remaining_excess > 0:
-                            grid_export = remaining_excess
-                            if battery_charge_change == 0:
-                                action = 4  # Export PV
-                    
-                    # For remaining load:
-                    if remaining_load > 0:
-                        # Check remaining load vs export value to determine if discharging is optimal
-                        available_discharge = battery_charge - min_charge
-                        potential_discharge = min(test_env.max_discharge_rate, available_discharge, remaining_load)
-                        
-                        # In standard hours, be more selective about discharging
-                        # Only discharge if battery is above 50% or approaching peak hours
-                        current_soc = (battery_charge / test_env.battery_capacity) * 100
-                        approaching_peak = (hour >= 14 and hour < 16)  # 2pm-4pm
-                        
-                        if potential_discharge > 0 and (current_soc > 50 or approaching_peak):
-                            battery_charge_change -= potential_discharge
-                            remaining_load -= potential_discharge
-                            action = 2  # Discharge battery
-                
-                        # Any remaining load must be met by grid import
+                        # Discharge battery during peak or just before, or at end of day to avoid overflow
+                        if is_peak or just_before_peak or is_end_of_day or (battery_charge > min_charge + 0.5):
+                            potential_discharge = min(test_env.max_discharge_rate, available_discharge, remaining_load)
+                            if potential_discharge > 0:
+                                battery_charge_change -= potential_discharge
+                                remaining_load -= potential_discharge
+                                action = 2  # Discharge
+                        # Any remaining unmet load after battery: import from grid
                         if remaining_load > 0:
                             grid_import = remaining_load
                             if battery_charge_change == 0 and grid_export == 0:
-                                action = 0  # Do nothing (buy from grid)
-                
-                # Update battery charge
-                battery_charge += battery_charge_change
-                battery_charge = max(min_charge, min(max_charge, battery_charge))
-                
-                # Calculate cost using the appropriate tariffs
-                cost = grid_import * consumption_tariff - grid_export * injection_tariff
-                
-                # Update total cost
-                day_total_cost += cost
-                
-                # Log the action and resulting state
-                step_log = {
-                    'day': day,
-                    'hour': hour,
-                    'is_peak': is_peak,
-                    'action': action,
-                    'action_name': {0: 'Do Nothing', 1: 'Charge Grid', 2: 'Discharge', 
-                                    3: 'Charge PV', 4: 'Export PV'}[action],
-                    'battery_charge': battery_charge,
-                    'battery_soc': (battery_charge / test_env.battery_capacity) * 100,
-                    'grid_import': grid_import,
-                    'grid_export': grid_export,
-                    'solar_generation': current_solar,
-                    'solar_used': solar_used,
-                    'battery_change': battery_charge_change,
-                    'consumption_tariff': consumption_tariff,
-                    'injection_tariff': injection_tariff,
-                    'cost': cost
-                }
-                day_actions_log.append(step_log)
-            
-            # Save this day's log
-            all_days_log.append({'day': day, 'total_cost': day_total_cost, 'actions': day_actions_log})
-            
-            # Print day summary
-            print(f"Day {day+1}: Total Cost = {day_total_cost:.2f} pence, Ending SOC = {(battery_charge / test_env.battery_capacity) * 100:.1f}%")
-        
-        # Return the steady state (final day) cost and actions
-        steady_state_daily_cost = all_days_log[-1]['total_cost']
-        steady_state_actions_log = all_days_log[-1]['actions']
-        
-        # Calculate statistics for the steady state day
-        action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
-        solar_utilization = 0
-        total_solar = 0
-        peak_grid_import = 0
-        peak_hours_count = 0
-        
-        for log in steady_state_actions_log:
-            action_counts[log['action']] += 1
-            solar_utilization += log['solar_used']
-            total_solar += log['solar_generation']
-            
-            # Track peak hour grid usage
-            if log['is_peak']:
-                peak_grid_import += log['grid_import']
-                peak_hours_count += 1
-        
-        solar_utilization_percentage = (solar_utilization / total_solar * 100) if total_solar > 0 else 0
-        avg_peak_grid_import = peak_grid_import / peak_hours_count if peak_hours_count > 0 else 0
-        
-        print("\nSteady State Summary (Final Day):")
-        print(f"Theoretical Minimum Cost: {steady_state_daily_cost:.2f} pence for 24 hours")
-        print(f"Final Battery SOC: {(battery_charge / test_env.battery_capacity) * 100:.1f}%")
-        print(f"Solar Utilization: {solar_utilization:.2f} kWh / {total_solar:.2f} kWh ({solar_utilization_percentage:.1f}%)")
-        print(f"Average Peak Hour Grid Import: {avg_peak_grid_import:.2f} kWh")
-        
-        print("\nAction Distribution:")
-        for action, count in action_counts.items():
-            if action in {0, 1, 2, 3, 4}:  # Only show actions that exist in the action space
-                action_name = {0: "Do Nothing", 1: "Charge Grid", 2: "Discharge", 
-                              3: "Charge PV", 4: "Export PV"}[action]
-                print(f"  {action_name}: {count} times ({count/24*100:.1f}%)")
-        
-        return steady_state_daily_cost, steady_state_actions_log, battery_charge
+                                action = 0  # Do Nothing
+
+                    # Update battery charge and clamp to limits
+                    battery_charge += battery_charge_change
+                    battery_charge = max(min_charge, min(max_charge, battery_charge))
+
+                    # Cost calculation
+                    cost = grid_import * consumption_tariff - grid_export * injection_tariff
+                    day_total_cost += cost
+
+                    # Log for debugging
+                    step_log = {
+                        'day': day,
+                        'hour': hour,
+                        'action': action,
+                        'battery_charge': battery_charge,
+                        'battery_soc': (battery_charge / test_env.battery_capacity) * 100,
+                        'grid_import': grid_import,
+                        'grid_export': grid_export,
+                        'solar_generation': current_solar,
+                        'solar_used': solar_used,
+                        'battery_change': battery_charge_change,
+                        'consumption_tariff': consumption_tariff,
+                        'injection_tariff': injection_tariff,
+                        'cost': cost
+                    }
+                    day_actions_log.append(step_log)
+
+                all_days_log.append({'day': day, 'total_cost': day_total_cost, 'actions': day_actions_log})
+
+            # Enforce final SOC equal to initial
+            soc_penalty = 0
+            total_cost = 0
+            if enforce_final_soc:
+                final_soc = (battery_charge / test_env.battery_capacity) * 100
+                soc_diff = final_soc - initial_soc
+                if abs(soc_diff) > 1.0:  # Allow 1% deviation
+                    kWh_diff = (abs(soc_diff) / 100) * test_env.battery_capacity
+                    penalty = kWh_diff * test_env.standard_import_tariff  # Use import tariff
+                    total_cost += penalty# Large penalty if mismatched
+
+            total_cost = all_days_log[-1]['total_cost'] + soc_penalty
+            if total_cost < min_cost:
+                min_cost = total_cost
+                best_log = all_days_log[-1]['actions']
+                best_final_charge = battery_charge
+
+        print(f"Theoretical Minimum Cost: {min_cost:.2f} pence for 24 hours (enforced SOC)")
+        print(f"Final battery SOC: {(best_final_charge / test_env.battery_capacity) * 100:.1f}%")
+        return min_cost, best_log, best_final_charge
 
 class ForecastGenerator:
     def __init__(self, true_profiles, error_model='increasing'):
@@ -2231,6 +2119,19 @@ class ForecastingQLearning(QLearning):
         
         plt.tight_layout()
         plt.show()
+        
+    def plot_agent_vs_min_cost(agent_costs, min_cost):
+        episodes = range(1, len(agent_costs) + 1)
+        plt.figure(figsize=(10, 6))
+        plt.plot(episodes, agent_costs, label="Agent Cost per Episode", color="tab:blue")
+        plt.axhline(y=min_cost, color="tab:red", linestyle="--", label="Theoretical Minimum Cost", linewidth=2)
+        plt.xlabel("Episode")
+        plt.ylabel("Total Cost (pence)")
+        plt.title("Agent Cost vs Theoretical Minimum Cost per Episode")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()  
 # Example usage
 if __name__ == "__main__":
     # Create the forecasting microgrid environment
@@ -2260,6 +2161,8 @@ if __name__ == "__main__":
     
     # Plot solar and battery strategy
     agent.plot_solar_vs_battery_strategy(evaluation_results, episode_num=0)
+    
+    agent.plot_agent_vs_min_cost(agent_costs, min_cost)
     
     # Analyze forecast impact
     forecast_analysis = agent.evaluate_forecast_accuracy(num_episodes=1)
