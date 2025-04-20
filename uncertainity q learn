@@ -615,6 +615,8 @@ class Microgrid:
         
         # Return the next state, reward, done flag, and info
         info = {
+            'time_step': self.time_step,
+            'action': action, # <--- Add this line!
             'cost': cost,
             'grid_import': grid_import,
             'grid_export': grid_export,
@@ -1317,10 +1319,22 @@ class QLearning:
         # Convert steps to DataFrame for easier analysis
         steps_df = pd.DataFrame([step for result in results for step in result['steps']])
         
+        print("steps_df columns:", steps_df.columns)
+        print("First row (if exists):", steps_df.iloc[0].to_dict() if len(steps_df) > 0 else "EMPTY")
+        
         fig, axs = plt.subplots(4, 1, figsize=(12, 20))
         
         # Plot battery charge over time
-        axs[0].plot(steps_df['time_step'], steps_df['battery_charge'])
+        # Determine which column to use for x-axis (time)
+        time_candidates = ['time_step', 'hour', 'step']
+        x_col = None
+        for candidate in time_candidates:
+            if candidate in steps_df.columns:
+                x_col = candidate
+                break
+
+        if x_col is None:
+            raise ValueError("No suitable time axis found in steps_df (looked for 'time_step', 'hour', 'step').")
         axs[0].set_title('Battery Charge Over Time')
         axs[0].set_xlabel('Hour of Day')
         axs[0].set_ylabel('Battery Charge (kWh)')
